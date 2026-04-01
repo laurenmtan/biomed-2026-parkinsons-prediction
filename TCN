@@ -1,0 +1,480 @@
+"""
+Parkinson's Disease Diagnosis via Temporal Convolutional Network (TCN)
+======================================================================
+Data:
+  - HC (Healthy Controls): HC101 - HC110
+  - NLS (Parkinson's):     NLS005, NLS022, NLS056, NLS101, NLS102, NLS121
+
+Features used:
+  - First 7 columns: Time, GeneralEvent, ClinicalEvent, L Foot Contact,
+    R Foot Contact, L Foot Pressure, R Foot Pressure
+    (Time + categorical cols are encoded; numerics used as-is)
+  - All LPressure1-16 and RPressure1-16 columns
+
+"""
+
+import os
+import numpy as np
+import pandas as pd
+from sklearn.preprocessing import StandardScaler, LabelEncoder
+from sklearn.model_selection import LeaveOneOut, StratifiedKFold
+from sklearn.metrics import (classification_report, confusion_matrix,
+                             roc_auc_score, accuracy_score)
+import matplotlib.pyplot as plt
+import warnings
+warnings.filterwarnings("ignore")
+
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from torch.utils.data import DataLoader, TensorDataset
+
+# ── Configuration ─────────────────────────────────────────────────────────────
+DATA_DIR = "/Users/sahana/PycharmProjects/biomed-2026-parkinsons-prediction"         # folder containing all *_SelfPace.csv files
+WINDOW     = 200               # timesteps per sample (2 seconds @ 100 Hz)
+STRIDE     = 50                # sliding window stride
+BATCH_SIZE = 32
+EPOCHS     = 10
+LR         = 1e-3
+SEED       = 42
+
+torch.manual_seed(SEED)
+np.random.seed(SEED)
+
+# ── 1. Feature Selection ───────────────────────────────────────────────────────
+FIRST_7 = [
+    "L Foot Contact",
+    "R Foot Contact",
+    "L Foot Pressure",
+    "R Foot Pressure",
+    # Time is converted to float seconds below
+    # GeneralEvent and ClinicalEvent are label-encoded below
+]
+CATEGORICAL_COLS = ["GeneralEvent", "ClinicalEvent"]
+
+def get_pressure_cols(df):
+    """Return all LPressure* and RPressure* column names present in df."""
+    return [c for c in df.columns
+            if (c.startswith("LPressure") or c.startswith("RPressure"))]
+
+# ── 2. Data Loading ────────────────────────────────────────────────────────────
+def parse_time(s):
+    """Convert '0.01 sec' → 0.01."""
+    try:
+        return float(str(s).replace(" sec", "").strip())
+    except Exception:
+        return np.nan
+
+def get_shared_pressure_cols(data_dir):
+    """
+    Scan all CSV files and return pressure columns that:
+      1. Exist in every file (intersection)
+      2. Have at least some non-NaN data in every file
+    This handles files where pressure sensors only record during walking
+    (NaN during standing phases at the start/end).
+    """
+    shared = None
+    for fname in sorted(os.listdir(data_dir)):
+        if not fname.endswith(".csv"):
+            continue
+        df = pd.read_csv(os.path.join(data_dir, fname), low_memory=False)
+        pcols = get_pressure_cols(df)
+        # Keep only columns that have at least some real data (not all NaN)
+        valid = set(c for c in pcols if df[c].notna().any())
+        shared = valid if shared is None else shared & valid
+    result = sorted(shared)
+    print(f"  Shared pressure columns across all files: {len(result)}")
+    return result
+
+
+def load_subject(path, label, le_dict, pressure_cols):
+    """
+    Load one CSV and return a 2D numpy array (timesteps × features) and label.
+    le_dict: dict of LabelEncoder per categorical column (fitted globally).
+    pressure_cols: fixed list of pressure columns shared across all subjects.
+    """
+    df = pd.read_csv(path, low_memory=False)
+
+    # --- Time (col 0) ---
+    time_feat = df["Time"].apply(parse_time).values.reshape(-1, 1)
+
+    # --- Categorical cols (cols 1-2) ---
+    cat_feats = []
+    for col in CATEGORICAL_COLS:
+        encoded = le_dict[col].transform(
+            df[col].fillna("unknown").astype(str)
+        ).reshape(-1, 1)
+        cat_feats.append(encoded.astype(float))
+
+    # --- Numeric first-7 cols ---
+    numeric_7 = df[FIRST_7].apply(pd.to_numeric, errors="coerce").fillna(0).values
+
+    # --- Pressure columns (fixed shared set) ---
+    pressure = df[pressure_cols].apply(pd.to_numeric, errors="coerce").fillna(0).values
+
+    # Concatenate all features: shape (T, n_features)
+    X = np.hstack([time_feat, *cat_feats, numeric_7, pressure])
+    return X.astype(np.float32), label
+
+
+def fit_label_encoders(data_dir):
+    """Fit LabelEncoders across all files so encoding is consistent."""
+    all_vals = {col: [] for col in CATEGORICAL_COLS}
+    for fname in os.listdir(data_dir):
+        if not fname.endswith(".csv"):
+            continue
+        df = pd.read_csv(os.path.join(data_dir, fname), low_memory=False,
+                         usecols=CATEGORICAL_COLS)
+        for col in CATEGORICAL_COLS:
+            all_vals[col].extend(df[col].fillna("unknown").astype(str).tolist())
+
+    le_dict = {}
+    for col in CATEGORICAL_COLS:
+        le = LabelEncoder()
+        le.fit(list(set(all_vals[col])))
+        le_dict[col] = le
+    return le_dict
+
+
+def sliding_windows(X, window, stride):
+    """Slice a (T, F) array into overlapping windows → (N, window, F)."""
+    windows = []
+    for start in range(0, len(X) - window + 1, stride):
+        windows.append(X[start:start + window])
+    return np.array(windows, dtype=np.float32)   # (N, W, F)
+
+
+
+def load_all_data(data_dir, window, stride):
+    """
+    Returns:
+        X_subjects : list of arrays (N_i, W, F)  – windows per subject
+        y_subjects : list of int labels per subject
+        subject_ids: list of subject names
+    """
+    le_dict = fit_label_encoders(data_dir)
+    pressure_cols = get_shared_pressure_cols(data_dir)  # consistent across all files
+
+    X_subjects, y_subjects, subject_ids = [], [], []
+
+    for fname in sorted(os.listdir(data_dir)):
+        if not fname.endswith(".csv"):
+            continue
+        path = os.path.join(data_dir, fname)
+        name = fname.replace("_SelfPace.csv", "")
+
+        if name.startswith("HC"):
+            label = 0   # Healthy Control
+        elif name.startswith("NLS") or name.startswith("NL"):
+            label = 1   # Parkinson's
+        else:
+            print(f"  [SKIP] Unknown prefix: {fname}")
+            continue
+
+        print(f"  Loading {fname} → label={label} ...", end=" ")
+        X_raw, lbl = load_subject(path, label, le_dict, pressure_cols)
+        wins = sliding_windows(X_raw, window, stride)
+        print(f"{len(wins)} windows, {X_raw.shape[1]} features")
+
+        X_subjects.append(wins)
+        y_subjects.append(lbl)
+        subject_ids.append(name)
+
+    return X_subjects, y_subjects, subject_ids
+
+# ── 3. TCN Architecture ────────────────────────────────────────────────────────
+class CausalConv1d(nn.Module):
+    """Causal (left-padded) dilated convolution."""
+    def __init__(self, in_ch, out_ch, kernel_size, dilation):
+        super().__init__()
+        self.padding = (kernel_size - 1) * dilation
+        self.conv = nn.Conv1d(in_ch, out_ch, kernel_size,
+                              dilation=dilation, padding=self.padding)
+
+    def forward(self, x):
+        return self.conv(x)[:, :, :-self.padding] if self.padding else self.conv(x)
+
+
+class TCNBlock(nn.Module):
+    """
+    One residual TCN block with two dilated causal convolutions,
+    BatchNorm, dropout, and a skip connection.
+    """
+    def __init__(self, in_ch, out_ch, kernel_size, dilation, dropout=0.2):
+        super().__init__()
+        self.conv1 = CausalConv1d(in_ch, out_ch, kernel_size, dilation)
+        self.conv2 = CausalConv1d(out_ch, out_ch, kernel_size, dilation)
+        self.drop1 = nn.Dropout(dropout)
+        self.drop2 = nn.Dropout(dropout)
+        self.relu  = nn.ReLU()
+        self.skip  = nn.Conv1d(in_ch, out_ch, 1) if in_ch != out_ch else None
+        self.norm1 = nn.BatchNorm1d(out_ch)
+        self.norm2 = nn.BatchNorm1d(out_ch)
+
+    def forward(self, x):
+        residual = x
+        out = self.relu(self.norm1(self.conv1(x)))
+        out = self.drop1(out)
+        out = self.relu(self.norm2(self.conv2(out)))
+        out = self.drop2(out)
+        if self.skip is not None:
+            residual = self.skip(residual)
+        return self.relu(out + residual)
+
+
+class TCN(nn.Module):
+    """
+    Full TCN for binary Parkinson's classification.
+
+    Architecture:
+      Input  → (B, F, T)   [channels-first for Conv1d]
+      TCNBlock × n_layers  (exponentially increasing dilation)
+      GlobalAvgPool        → (B, hidden)
+      FC layers + sigmoid  → scalar probability
+    """
+    def __init__(self, n_features, n_channels=64, n_layers=6,
+                 kernel_size=3, dropout=0.2):
+        super().__init__()
+        layers = []
+        in_ch = n_features
+        for i in range(n_layers):
+            dilation = 2 ** i          # 1, 2, 4, 8, 16, 32
+            layers.append(TCNBlock(in_ch, n_channels, kernel_size,
+                                   dilation, dropout))
+            in_ch = n_channels
+        self.network = nn.Sequential(*layers)
+        self.classifier = nn.Sequential(
+            nn.Linear(n_channels, 64),
+            nn.ReLU(),
+            nn.Dropout(dropout),
+            nn.Linear(64, 1)
+        )
+
+    def forward(self, x):
+        # x: (B, T, F) → transpose to (B, F, T)
+        x = x.permute(0, 2, 1)
+        x = self.network(x)
+        x = x.mean(dim=-1)            # global average pool over time
+        return self.classifier(x).squeeze(-1)
+
+# ── 4. Training Utilities ──────────────────────────────────────────────────────
+def make_loaders(X_train, y_train, X_val, y_val, batch_size):
+    def to_tensor(X, y):
+        return TensorDataset(torch.tensor(X, dtype=torch.float32),
+                             torch.tensor(y, dtype=torch.float32))
+    train_ds = to_tensor(X_train, y_train)
+    val_ds   = to_tensor(X_val,   y_val)
+    return (DataLoader(train_ds, batch_size=batch_size, shuffle=True),
+            DataLoader(val_ds,   batch_size=batch_size))
+
+
+def train_epoch(model, loader, optimizer, criterion, device):
+    model.train()
+    total_loss = 0
+    for xb, yb in loader:
+        xb, yb = xb.to(device), yb.to(device)
+        optimizer.zero_grad()
+        pred = model(xb)
+        loss = criterion(pred, yb)
+        loss.backward()
+        nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+        optimizer.step()
+        total_loss += loss.item() * len(xb)
+    return total_loss / len(loader.dataset)
+
+
+@torch.no_grad()
+def evaluate(model, loader, device):
+    model.eval()
+    probs, labels = [], []
+    for xb, yb in loader:
+        p = torch.sigmoid(model(xb.to(device))).cpu().numpy()
+        probs.extend(p.tolist())
+        labels.extend(yb.numpy().tolist())
+    return np.array(probs), np.array(labels)
+
+# ── 5. Leave-One-Subject-Out Cross-Validation ─────────────────────────────────
+def loso_cv(X_subjects, y_subjects, subject_ids, device,
+            epochs=EPOCHS, lr=LR, batch_size=BATCH_SIZE):
+    """
+    Leave-One-Subject-Out: train on all subjects except one, test on held-out.
+    Returns per-subject predictions for final metrics.
+    """
+    n_subjects = len(X_subjects)
+    n_features = X_subjects[0].shape[2]
+
+    all_probs  = []
+    all_labels = []
+    results    = []
+
+    print(f"\n{'='*60}")
+    print(f"  LOSO Cross-Validation  ({n_subjects} subjects)")
+    print(f"  n_features={n_features}  window={WINDOW}  stride={STRIDE}")
+    print(f"{'='*60}\n")
+
+    for test_idx in range(n_subjects):
+        subj = subject_ids[test_idx]
+        print(f"  [{test_idx+1}/{n_subjects}] Test subject: {subj} "
+              f"(label={'PD' if y_subjects[test_idx]==1 else 'HC'})")
+
+        # Build train / test arrays
+        X_tr = np.concatenate([X_subjects[i] for i in range(n_subjects) if i != test_idx])
+        y_tr = np.concatenate([[y_subjects[i]] * len(X_subjects[i])
+                                for i in range(n_subjects) if i != test_idx])
+        X_te = X_subjects[test_idx]
+        y_te = np.array([y_subjects[test_idx]] * len(X_te))
+
+        # Normalize per-feature using training statistics
+        scaler = StandardScaler()
+        shape_tr = X_tr.shape
+        shape_te = X_te.shape
+        X_tr = scaler.fit_transform(X_tr.reshape(-1, n_features)).reshape(shape_tr)
+        X_te = scaler.transform(X_te.reshape(-1, n_features)).reshape(shape_te)
+
+        # Handle class imbalance with pos_weight
+        n_pos = y_tr.sum()
+        n_neg = len(y_tr) - n_pos
+        pos_weight = torch.tensor([n_neg / (n_pos + 1e-8)], device=device)
+        criterion = nn.BCEWithLogitsLoss(pos_weight=pos_weight)
+
+        train_loader, val_loader = make_loaders(X_tr, y_tr, X_te, y_te, batch_size)
+
+        model = TCN(n_features=n_features).to(device)
+        optimizer = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=1e-4)
+        scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=epochs)
+
+        best_loss = float("inf")
+        best_state = None
+
+        for epoch in range(1, epochs + 1):
+            loss = train_epoch(model, train_loader, optimizer, criterion, device)
+            scheduler.step()
+            print(f"         epoch {epoch}/{epochs}  loss={loss:.4f}", flush=True)
+            if loss < best_loss:
+                best_loss = loss
+                best_state = {k: v.cpu().clone() for k, v in model.state_dict().items()}
+
+        # Restore best weights and predict
+        model.load_state_dict(best_state)
+        probs, labels = evaluate(model, val_loader, device)
+
+        # Majority vote: aggregate window-level probs to subject-level
+        subj_prob  = probs.mean()
+        subj_label = y_subjects[test_idx]
+        subj_pred  = int(subj_prob >= 0.5)
+
+        all_probs.append(subj_prob)
+        all_labels.append(subj_label)
+        results.append({
+            "subject":  subj,
+            "true":     subj_label,
+            "pred":     subj_pred,
+            "prob":     subj_prob,
+            "correct":  subj_pred == subj_label
+        })
+
+        print(f"         prob={subj_prob:.3f}  pred={'PD' if subj_pred else 'HC'}"
+              f"  true={'PD' if subj_label else 'HC'}"
+              f"  {'✓' if subj_pred==subj_label else '✗'}\n")
+
+    return results, np.array(all_probs), np.array(all_labels)
+
+# ── 6. Results & Visualisation ─────────────────────────────────────────────────
+def print_results(results, probs, labels):
+    preds = (probs >= 0.5).astype(int)
+
+    print("\n" + "="*60)
+    print("  FINAL RESULTS (subject-level majority vote)")
+    print("="*60)
+    print(classification_report(labels, preds,
+                                 target_names=["HC (Control)", "PD (Parkinson's)"]))
+
+    cm = confusion_matrix(labels, preds)
+    print("Confusion Matrix:")
+    print(f"  {'':15s}  Pred HC  Pred PD")
+    print(f"  {'True HC':15s}  {cm[0,0]:>7d}  {cm[0,1]:>7d}")
+    print(f"  {'True PD':15s}  {cm[1,0]:>7d}  {cm[1,1]:>7d}")
+
+    if len(np.unique(labels)) == 2:
+        auc = roc_auc_score(labels, probs)
+        print(f"\n  ROC-AUC: {auc:.4f}")
+    print(f"  Accuracy: {accuracy_score(labels, preds):.4f}")
+
+    # Per-subject table
+    print("\n  Per-subject breakdown:")
+    print(f"  {'Subject':<12} {'True':<8} {'Pred':<8} {'Prob':<8} {'OK?'}")
+    print("  " + "-"*45)
+    for r in results:
+        print(f"  {r['subject']:<12} "
+              f"{'PD' if r['true'] else 'HC':<8} "
+              f"{'PD' if r['pred'] else 'HC':<8} "
+              f"{r['prob']:.3f}    "
+              f"{'✓' if r['correct'] else '✗'}")
+
+
+def plot_results(results, probs, labels, save_path="tcn_results.png"):
+    fig, axes = plt.subplots(1, 2, figsize=(12, 5))
+    fig.suptitle("TCN Parkinson's Diagnosis – LOSO Results", fontsize=13)
+
+    # --- Bar chart of subject probabilities ---
+    ax = axes[0]
+    subjects = [r["subject"] for r in results]
+    colors   = ["#e74c3c" if r["true"] == 1 else "#2ecc71" for r in results]
+    bars = ax.bar(subjects, probs, color=colors, edgecolor="black", alpha=0.85)
+    ax.axhline(0.5, color="navy", linestyle="--", linewidth=1.5, label="Decision boundary")
+    ax.set_ylim(0, 1)
+    ax.set_ylabel("Predicted PD probability")
+    ax.set_xlabel("Subject")
+    ax.set_title("Subject-level predictions")
+    ax.tick_params(axis="x", rotation=45)
+    from matplotlib.patches import Patch
+    legend_el = [Patch(facecolor="#e74c3c", label="True PD"),
+                 Patch(facecolor="#2ecc71", label="True HC")]
+    ax.legend(handles=legend_el + [plt.Line2D([0],[0], color="navy",
+               linestyle="--", label="Threshold 0.5")])
+
+    # --- Confusion matrix heatmap ---
+    ax = axes[1]
+    preds = (probs >= 0.5).astype(int)
+    cm = confusion_matrix(labels, preds)
+    im = ax.imshow(cm, cmap="Blues")
+    ax.set_xticks([0, 1]); ax.set_yticks([0, 1])
+    ax.set_xticklabels(["HC", "PD"]); ax.set_yticklabels(["HC", "PD"])
+    ax.set_xlabel("Predicted"); ax.set_ylabel("True")
+    ax.set_title("Confusion Matrix")
+    for i in range(2):
+        for j in range(2):
+            ax.text(j, i, cm[i, j], ha="center", va="center",
+                    color="white" if cm[i, j] > cm.max()/2 else "black",
+                    fontsize=16, fontweight="bold")
+    plt.colorbar(im, ax=ax)
+
+    plt.tight_layout()
+    plt.savefig(save_path, dpi=150, bbox_inches="tight")
+    print(f"\n  Plot saved → {save_path}")
+    plt.show()
+
+
+# ── 7. Main ────────────────────────────────────────────────────────────────────
+if __name__ == "__main__":
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    print(f"Using device: {device}")
+
+    print("\n[1/3] Loading data...")
+    X_subjects, y_subjects, subject_ids = load_all_data(DATA_DIR, WINDOW, STRIDE)
+
+    print(f"\n  Loaded {len(X_subjects)} subjects")
+    print(f"  HC={sum(l==0 for l in y_subjects)}  PD={sum(l==1 for l in y_subjects)}")
+    print(f"  Feature dimension: {X_subjects[0].shape[2]}")
+    total_windows = sum(len(x) for x in X_subjects)
+    print(f"  Total windows: {total_windows}")
+
+    print("\n[2/3] Running LOSO cross-validation...")
+    results, all_probs, all_labels = loso_cv(
+        X_subjects, y_subjects, subject_ids, device,
+        epochs=EPOCHS, lr=LR, batch_size=BATCH_SIZE
+    )
+
+    print("\n[3/3] Reporting results...")
+    print_results(results, all_probs, all_labels)
+    plot_results(results, all_probs, all_labels, save_path="tcn_results.png")
